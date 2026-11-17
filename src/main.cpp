@@ -17,6 +17,8 @@
 #include <boost/beast/version.hpp>
 
 #include <algorithm>
+#include <chrono>
+#include <cstdio>
 #include <cstdlib>
 #include <iostream>
 #include <memory>
@@ -53,6 +55,49 @@ static http::response<http::string_body> handle_request(const http::request<http
     return make(http::status::not_found, "text/plain", "Not found\n");
 }
 
+// KEEP THIS: one log line per request (status + duration) is what the workspace Monitoring tab charts.
+// Writes one JSON line per finished request to stdout, e.g.
+//   {"status":200,"durationMs":0.123,"method":"GET","path":"/health","ua":"curl/8.5.0"}
+// Never the query string, headers other than the user agent, or bodies.
+static void json_escape(std::string& out, beast::string_view in)
+{
+    static const char* hex = "0123456789abcdef";
+    for (unsigned char c : in) {
+        if (c == '"' || c == '\\') {
+            out += '\\';
+            out += char(c);
+        } else if (c < 0x20) {
+            out += "\\u00";
+            out += hex[c >> 4];
+            out += hex[c & 0xf];
+        } else {
+            out += char(c);
+        }
+    }
+}
+
+static void log_request(const http::request<http::string_body>& req, unsigned status,
+                        std::chrono::steady_clock::time_point start)
+{
+    const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
+    beast::string_view path = req.target();
+    path = path.substr(0, path.find('?'));
+    std::string line = "{\"status\":" + std::to_string(status);
+    char dur[32];
+    std::snprintf(dur, sizeof dur, "%.3f", ms);
+    line += ",\"durationMs\":";
+    line += dur;
+    line += ",\"method\":\"";
+    json_escape(line, req.method_string());
+    line += "\",\"path\":\"";
+    json_escape(line, path);
+    line += "\",\"ua\":\"";
+    json_escape(line, req[http::field::user_agent]);
+    line += "\"}\n";
+    std::fwrite(line.data(), 1, line.size(), stdout);  // one write per line: no interleaving across threads
+    std::fflush(stdout);
+}
+
 // One HTTP connection.
 class session : public std::enable_shared_from_this<session>
 {
@@ -83,9 +128,12 @@ private:
         if (ec)
             return;
 
+        const auto start = std::chrono::steady_clock::now();
         auto res = std::make_shared<http::response<http::string_body>>(handle_request(req_));
         http::async_write(stream_, *res,
-            [self = shared_from_this(), res](beast::error_code ec, std::size_t) {
+            [self = shared_from_this(), res, start](beast::error_code ec, std::size_t) {
+                // KEEP THIS: one log line per request (status + duration) is what the workspace Monitoring tab charts.
+                log_request(self->req_, res->result_int(), start);
                 if (ec)
                     return;
                 if (!res->keep_alive())
